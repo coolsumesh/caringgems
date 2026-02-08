@@ -3,50 +3,9 @@ const db = require('./db');
 const telegram = require('./telegram');
 const whatsapp = require('./whatsapp');
 
-// Get users who need reminders at current time
-function getUsersForReminder(time) {
-  const stmt = db.prepare(`
-    SELECT u.*, m.name as medication_name, m.id as medication_id
-    FROM users u
-    JOIN medications m ON m.user_id = u.id
-    WHERE u.reminder_time = ?
-  `);
-  return stmt.all(time);
-}
-
-// Mark medication as taken
-function markTaken(userId, medicationId, date) {
-  const stmt = db.prepare(`
-    INSERT INTO logs (user_id, medication_id, date, taken, taken_at)
-    VALUES (?, ?, ?, 1, datetime('now'))
-    ON CONFLICT(user_id, date) DO UPDATE SET taken = 1, taken_at = datetime('now')
-  `);
-  
-  try {
-    stmt.run(userId, medicationId, date);
-    return true;
-  } catch (e) {
-    // If no unique constraint, just insert
-    const insertStmt = db.prepare(`
-      INSERT INTO logs (user_id, medication_id, date, taken, taken_at)
-      VALUES (?, ?, ?, 1, datetime('now'))
-    `);
-    insertStmt.run(userId, medicationId, date);
-    return true;
-  }
-}
-
-// Get family watchers for a user
-function getWatchers(userId) {
-  const stmt = db.prepare(`
-    SELECT * FROM family WHERE user_id = ? AND notify_on_taken = 1
-  `);
-  return stmt.all(userId);
-}
-
 // Send reminders for a specific time
 async function sendReminders(time) {
-  const users = getUsersForReminder(time);
+  const users = db.getUsersForReminder(time);
   
   for (const user of users) {
     try {
@@ -57,11 +16,11 @@ async function sendReminders(time) {
       }
       
       // Log reminder sent
-      const stmt = db.prepare(`
-        INSERT INTO logs (user_id, medication_id, date, reminded_at)
-        VALUES (?, ?, date('now'), datetime('now'))
-      `);
-      stmt.run(user.id, user.medication_id);
+      db.createLog({
+        user_id: user.id,
+        medication_id: user.medication_id,
+        reminded_at: new Date().toISOString()
+      });
       
       console.log(`Reminder sent to ${user.name || user.phone}`);
     } catch (err) {
@@ -70,9 +29,30 @@ async function sendReminders(time) {
   }
 }
 
+// Mark medication as taken
+function markTaken(userId, medicationId) {
+  const today = new Date().toISOString().split('T')[0];
+  
+  // Check if already logged today
+  const existing = db.getTodayLog(userId);
+  if (existing) {
+    return false;
+  }
+  
+  db.createLog({
+    user_id: userId,
+    medication_id: medicationId,
+    date: today,
+    taken: 1,
+    taken_at: new Date().toISOString()
+  });
+  
+  return true;
+}
+
 // Notify family when medication is taken
 async function notifyWatchers(userId, userName, medicationName) {
-  const watchers = getWatchers(userId);
+  const watchers = db.getWatchersByUserId(userId);
   const now = new Date().toLocaleTimeString('en-IN', { 
     hour: '2-digit', 
     minute: '2-digit',
@@ -94,18 +74,16 @@ async function notifyWatchers(userId, userName, medicationName) {
 
 // Calculate streak for a user
 function getStreak(userId) {
-  const stmt = db.prepare(`
-    SELECT date, taken FROM logs 
-    WHERE user_id = ? 
-    ORDER BY date DESC
-  `);
-  const logs = stmt.all(userId);
+  const logs = db.getLogsByUserId(userId, 30);
   
   let streak = 0;
   const today = new Date().toISOString().split('T')[0];
   let checkDate = today;
   
-  for (const log of logs) {
+  // Sort logs by date descending
+  const sortedLogs = logs.sort((a, b) => b.date.localeCompare(a.date));
+  
+  for (const log of sortedLogs) {
     if (log.date === checkDate && log.taken) {
       streak++;
       // Go to previous day
@@ -122,14 +100,7 @@ function getStreak(userId) {
 
 // Generate weekly report for a user
 function generateWeeklyReport(userId, userName) {
-  const stmt = db.prepare(`
-    SELECT date, taken, taken_at FROM logs
-    WHERE user_id = ?
-    AND date >= date('now', '-7 days')
-    ORDER BY date ASC
-  `);
-  const logs = stmt.all(userId);
-  
+  const logs = db.getLogsByUserId(userId, 7);
   const streak = getStreak(userId);
   const taken = logs.filter(l => l.taken).length;
   const missed = 7 - taken;
@@ -155,19 +126,26 @@ function startScheduler() {
   // Check every minute for reminders
   cron.schedule('* * * * *', () => {
     const now = new Date();
-    const time = now.toTimeString().slice(0, 5); // HH:MM
+    // Convert to IST
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const ist = new Date(now.getTime() + istOffset);
+    const time = ist.toISOString().slice(11, 16); // HH:MM
     sendReminders(time);
   });
   
   // Weekly report every Sunday at 10 AM IST (4:30 UTC)
   cron.schedule('30 4 * * 0', async () => {
-    const users = db.prepare('SELECT * FROM users').all();
+    const users = db.getAllUsers();
     for (const user of users) {
       const report = generateWeeklyReport(user.id, user.name || 'User');
-      if (user.channel === 'telegram' && user.telegram_chat_id) {
-        await telegram.sendWeeklyReport(user.telegram_chat_id, report);
-      } else if (user.channel === 'whatsapp' && user.is_premium) {
-        await whatsapp.sendWeeklyReport(user.phone, report);
+      try {
+        if (user.channel === 'telegram' && user.telegram_chat_id) {
+          await telegram.sendWeeklyReport(user.telegram_chat_id, report);
+        } else if (user.channel === 'whatsapp' && user.is_premium) {
+          await whatsapp.sendWeeklyReport(user.phone, report);
+        }
+      } catch (err) {
+        console.error(`Failed to send report to ${user.phone}:`, err.message);
       }
     }
   });
@@ -177,6 +155,7 @@ function startScheduler() {
 
 module.exports = {
   startScheduler,
+  sendReminders,
   markTaken,
   notifyWatchers,
   getStreak,

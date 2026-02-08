@@ -4,7 +4,7 @@ const express = require('express');
 const db = require('./db');
 const telegram = require('./telegram');
 const whatsapp = require('./whatsapp');
-const { startScheduler, markTaken, notifyWatchers } = require('./reminder');
+const { startScheduler, markTaken, notifyWatchers, getStreak } = require('./reminder');
 
 const app = express();
 app.use(express.json());
@@ -37,7 +37,11 @@ app.post('/webhook/telegram', async (req, res) => {
       
       if (text === '/start') {
         await handleStart(chatId, message.from, 'telegram');
-      } else if (['yes', 'taken', 'done', 'yep', 'yeah'].includes(text)) {
+      } else if (text.startsWith('/time ')) {
+        await handleSetTime(chatId, text.replace('/time ', '').trim());
+      } else if (text === '/status') {
+        await handleStatus(chatId);
+      } else if (['yes', 'taken', 'done', 'yep', 'yeah', 'y'].includes(text)) {
         await handleTaken(chatId, 'telegram');
       }
     }
@@ -74,7 +78,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
         const phone = msg.from;
         const text = msg.text?.body?.toLowerCase().trim();
         
-        if (['yes', 'taken', 'done', 'yep', 'yeah'].includes(text)) {
+        if (['yes', 'taken', 'done', 'yep', 'yeah', 'y'].includes(text)) {
           await handleTaken(phone, 'whatsapp');
         }
       }
@@ -92,22 +96,22 @@ async function handleStart(chatId, from, channel) {
   const name = from.first_name || 'there';
   
   // Check if user exists
-  let user = db.prepare('SELECT * FROM users WHERE telegram_chat_id = ?').get(chatId);
+  let user = db.findUserByTelegramId(chatId);
   
   if (!user) {
     // Create new user
-    const stmt = db.prepare(`
-      INSERT INTO users (phone, name, channel, telegram_chat_id, trial_started_at)
-      VALUES (?, ?, ?, ?, datetime('now'))
-    `);
-    stmt.run(`tg_${chatId}`, name, channel, chatId);
+    user = db.createUser({
+      name,
+      channel,
+      telegram_chat_id: chatId
+    });
     
     // Create default medication
-    user = db.prepare('SELECT * FROM users WHERE telegram_chat_id = ?').get(chatId);
-    db.prepare(`
-      INSERT INTO medications (user_id, name, dosage)
-      VALUES (?, 'Daily Medication', '1 tablet')
-    `).run(user.id);
+    db.createMedication({
+      user_id: user.id,
+      name: 'Daily Medication',
+      dosage: '1 tablet'
+    });
   }
   
   const welcome = `
@@ -116,17 +120,16 @@ async function handleStart(chatId, from, channel) {
 Hi ${name}! I'll help you remember your daily medications.
 
 <b>How it works:</b>
-• I'll send you a reminder every day
+• I'll send you a reminder every day at <b>${user.reminder_time}</b> IST
 • Reply <b>yes</b> or <b>taken</b> when you've taken it
 • Get weekly reports of your progress
 
 <b>Commands:</b>
-/start - This message
 /time HH:MM - Set reminder time (e.g., /time 09:00)
 /status - Check your streak
 
 🆓 <b>Free on Telegram forever!</b>
-Want WhatsApp reminders? Upgrade to Premium.
+Want WhatsApp reminders? Visit caringgems.in
 
 Let's keep you healthy! 💊
   `.trim();
@@ -134,36 +137,87 @@ Let's keep you healthy! 💊
   await telegram.sendMessage(chatId, welcome);
 }
 
+// Handle /time command
+async function handleSetTime(chatId, timeStr) {
+  const user = db.findUserByTelegramId(chatId);
+  
+  if (!user) {
+    await telegram.sendMessage(chatId, 'Please /start first!');
+    return;
+  }
+  
+  // Validate time format
+  const timeRegex = /^([01]?[0-9]|2[0-3]):([0-5][0-9])$/;
+  if (!timeRegex.test(timeStr)) {
+    await telegram.sendMessage(chatId, '❌ Invalid time format. Use HH:MM (e.g., 09:00 or 21:30)');
+    return;
+  }
+  
+  // Normalize to HH:MM
+  const [hours, minutes] = timeStr.split(':');
+  const normalizedTime = `${hours.padStart(2, '0')}:${minutes}`;
+  
+  db.updateUser(user.id, { reminder_time: normalizedTime });
+  
+  await telegram.sendMessage(chatId, `✅ Reminder time set to <b>${normalizedTime}</b> IST\n\nYou'll get your daily reminder at this time.`);
+}
+
+// Handle /status command
+async function handleStatus(chatId) {
+  const user = db.findUserByTelegramId(chatId);
+  
+  if (!user) {
+    await telegram.sendMessage(chatId, 'Please /start first!');
+    return;
+  }
+  
+  const streak = getStreak(user.id);
+  const todayLog = db.getTodayLog(user.id);
+  
+  let status = `📊 <b>Your Status</b>\n\n`;
+  status += `🔥 Current streak: <b>${streak} days</b>\n`;
+  status += `⏰ Reminder time: <b>${user.reminder_time}</b> IST\n`;
+  status += `📅 Today: ${todayLog ? '✅ Taken' : '⏳ Pending'}\n`;
+  
+  if (streak >= 7) {
+    status += `\n🌟 Amazing! Keep up the great work!`;
+  } else if (streak >= 3) {
+    status += `\n💪 Good going! Build that streak!`;
+  } else {
+    status += `\n🎯 Let's build a healthy habit!`;
+  }
+  
+  await telegram.sendMessage(chatId, status);
+}
+
 // Handle medication taken
 async function handleTaken(identifier, channel) {
   let user;
   
   if (channel === 'telegram') {
-    user = db.prepare('SELECT * FROM users WHERE telegram_chat_id = ?').get(identifier);
+    user = db.findUserByTelegramId(identifier);
   } else {
-    user = db.prepare('SELECT * FROM users WHERE phone = ?').get(identifier);
+    user = db.findUserByPhone(identifier);
   }
   
   if (!user) {
     console.log('User not found:', identifier);
+    if (channel === 'telegram') {
+      await telegram.sendMessage(identifier, 'Please /start first!');
+    }
     return;
   }
   
   // Get medication
-  const medication = db.prepare('SELECT * FROM medications WHERE user_id = ?').get(user.id);
+  const medication = db.getMedicationByUserId(user.id);
   
   if (!medication) {
     console.log('No medication found for user:', user.id);
     return;
   }
   
-  // Mark as taken
-  const today = new Date().toISOString().split('T')[0];
-  
   // Check if already logged today
-  const existing = db.prepare(`
-    SELECT * FROM logs WHERE user_id = ? AND date = ? AND taken = 1
-  `).get(user.id, today);
+  const existing = db.getTodayLog(user.id);
   
   if (existing) {
     if (channel === 'telegram') {
@@ -174,19 +228,21 @@ async function handleTaken(identifier, channel) {
     return;
   }
   
-  // Log it
-  db.prepare(`
-    INSERT INTO logs (user_id, medication_id, date, taken, taken_at)
-    VALUES (?, ?, ?, 1, datetime('now'))
-  `).run(user.id, medication.id, today);
+  // Mark as taken
+  markTaken(user.id, medication.id);
   
   // Get streak
-  const { getStreak } = require('./reminder');
   const streak = getStreak(user.id);
   
-  const response = streak > 1 
+  let response = streak > 1 
     ? `Great! ✅ Recorded!\n\n🔥 ${streak} day streak! Keep it up!`
     : `Great! ✅ Recorded!`;
+  
+  if (streak === 7) {
+    response += `\n\n🎉 One week streak! Amazing!`;
+  } else if (streak === 30) {
+    response += `\n\n🏆 30 day streak! You're a champion!`;
+  }
   
   if (channel === 'telegram') {
     await telegram.sendMessage(identifier, response);
